@@ -1,5 +1,8 @@
 # RaidConsumes
 
+<img width="2096" height="1277" alt="image" src="https://github.com/user-attachments/assets/0685a558-ee8a-43d0-8bef-e21eb2788905" />
+
+
 A raid consumable checker for OctoWoW (1.12-era vanilla API), built the same
 way as WarlockCursePower: no external libraries, just raw Lua and stock
 FrameXML templates.
