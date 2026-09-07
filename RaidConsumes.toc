@@ -1,0 +1,14 @@
+## Interface: 11200
+## Title: RaidConsumes
+## Notes: Raid consumable checker for OctoWoW -- shows raiders missing required consumables
+## Author: Waylock
+## Version: 2.6.3
+## SavedVariables: RaidConsumesDB
+
+Data.lua
+Scan.lua
+UI.lua
+History.lua
+Sync.lua
+Minimap.lua
+RaidConsumes.lua
