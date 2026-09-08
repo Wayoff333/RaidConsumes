@@ -1,8 +1,5 @@
 # RaidConsumes
 
-<img width="2096" height="1277" alt="image" src="https://github.com/user-attachments/assets/0685a558-ee8a-43d0-8bef-e21eb2788905" />
-
-
 A raid consumable checker for OctoWoW (1.12-era vanilla API), built the same
 way as WarlockCursePower: no external libraries, just raw Lua and stock
 FrameXML templates.
@@ -127,6 +124,183 @@ untick a shown one, independent of what's actually required; it's purely
 a display filter, and switching classes resets it back to that class's
 defaults.
 
+**Items required by more than one role show up under each of them**
+(v2.6.5, per Waylock's request): Flask of the Titans, Elixir of the
+Mongoose, Elixir of Giants, Juju Power, Ground Scorpok Assay, and Elemental
+Sharpening Stone are all seeded defaults for both Tanks and Physical DPS
+(a Warrior needs the same Strength/Agility items whether tanking or
+DPSing), and Dreamshard Elixir and Cerebral Cortex Compound (added
+v2.6.7) are both defaults for Healers and Caster DPS -- each of these now
+appears, fully checkable, in both of its sections instead of being buried
+under just one (a Warrior, who sees both Tanks and Physical DPS by
+default, will actually see Flask of the Titans listed twice -- that's
+intentional, not a duplicate bug). There's still only one real checkbox
+per item per class/role behind the scenes -- ticking or unticking it in
+either section instantly updates the same one, and the other listing
+reflects the change right away too.
+
+**Added (v2.6.7): Cerebral Cortex Compound is now also a Mage/Warlock/
+Caster DPS default**, per Waylock's report that it was "hiding under
+Healers" -- it's an Intellect potion useful to any caster, not just
+healers, so (same treatment as Dreamshard Elixir) it's now seeded on those
+three checklists too and shows under both the Healers and Caster DPS
+sections in Settings, on top of its existing Priest/Druid/Healer defaults.
+
+**Fixed (v2.6.12): a full buff-name audit of every Flask/Elixir/Potion in
+the list**, after Waylock reported "other flasks are not counting
+either" following the v2.6.11 fixes. Researched each item's real applied
+buff name via Wowhead Classic spell data (the item's own "Use:" tooltip
+line links to a spell ID; that spell's title, on the Classic tab
+specifically, is what actually shows on the buff bar and its tooltip --
+not necessarily the item's own name), cross-checked against classicdb.ch
+and a live buff-tracking addon's `GetSpellInfo()` table where possible.
+Same story as v2.6.11's three: several of these drop a "Flask of"/"Elixir
+of" prefix, and a couple don't resemble the item name at all. Every fix
+below is additive (the item's own name still matches too):
+
+| Item | Actual buff name |
+|---|---|
+| Flask of Distilled Wisdom | "Distilled Wisdom" |
+| Elixir of Superior Defense | "Greater Armor" |
+| Greater Stoneshield Potion | "Greater Stoneshield" |
+| Elixir of Giants | "Elixir of **the** Giants" (extra word, easy to miss) |
+| Ground Scorpok Assay | "Strike of the Scorpok" |
+| Major Troll's Blood Potion | "Regeneration" |
+| Mageblood Potion | "Mana Regeneration" |
+| Elixir of Greater Firepower | "Greater Firepower" |
+| Limited Invulnerability Potion | "Invulnerability" |
+
+Two of these ("Regeneration" and "Mana Regeneration") are generic enough
+that some unrelated effect could theoretically share the name -- flagged
+in `Data.lua` as worth an `/rc debug` spot-check if either ever seems to
+over-trigger.
+
+**Confirmed correct, no change needed:** Flask of the Titans, Elixir of
+the Mongoose, Juju Power, Juju Might, Greater Arcane Elixir, R.O.I.D.S.
+("Rage of Ages", already known), and Potion of Quickness.
+
+**Deliberately left alone, needs your own `/rc debug` to resolve:**
+
+- **Elixir of Fortitude** -- two independent databases suggest the real
+  buff is called "Health II" (a generic Blizzard template name used
+  across many unrelated effects), but nothing could confirm it against an
+  actual player's buff bar, and it's exactly the kind of generic name
+  that could misfire on something else entirely. Not added automatically
+  -- if this one's still not detecting for you, run `/rc debug` with it up
+  and I'll add the real name once it's confirmed.
+- **Elixir of Greater Nature Power** and **Potion of Quickness** --
+  their item IDs (50237 / 61181) don't exist on Wowhead Classic/real
+  Blizzard Classic at all, only on Turtle WoW's own database -- likely
+  where OctoWoW's item set draws from for these two. Potion of Quickness's
+  Turtle-WoW buff name matches its item name (confirmed, no change
+  needed); Elixir of Greater Nature Power's couldn't be confirmed either
+  way.
+
+**Also newly documented (not a fix, a real limitation): Major Healing
+Potion and Major Mana Potion can never be detected, for anyone, ever.**
+They're instant-effect potions (a direct heal / direct mana restore) with
+no timed buff or aura at all -- there's nothing for `UnitBuff` to see,
+the same reason Heavy Runecloth Bandage was left out of the list entirely
+(see below). Both are off by default on every class/role already, so
+this has no real-world effect unless you specifically tick one on in
+Settings -- if you do, it will read as permanently missing with no way to
+clear it. Worth removing from the list entirely in a future version
+rather than leaving a checkbox that can never be satisfied.
+
+Food-buff items (Nightfin Soup, Mightfish Steak, Le Fishe Au Chocolat, and
+similar) and the remaining OctoWoW/Turtle-WoW-custom items (Dreamshard
+Elixir, Dreamtonic, the Concoctions, the rested-drink items) haven't been
+audited yet -- Wowhead Classic doesn't have most of them (their item IDs
+are outside Blizzard's real range), so they need either OctoWoW's own
+database or your own `/rc debug` output to verify properly. Continuing
+that pass separately.
+
+**Fixed (v2.6.11): Flask of Supreme Power and Elixir of Shadow Power
+weren't detecting for Waylock even with both genuinely active** (plus a
+third, unreported one his own debug output caught: Cerebral Cortex
+Compound). Root cause, found via `/rc debug`: same class of mismatch as
+R.O.I.D.S./"Rage of Ages" below -- the actual buff each of these applies
+drops the "Flask of"/"Elixir of" prefix, or in Cerebral Cortex Compound's
+case doesn't resemble the item name at all:
+
+| Item | Actual buff name |
+|---|---|
+| Flask of Supreme Power | "Supreme Power" |
+| Elixir of Shadow Power | "Shadow Power" |
+| Cerebral Cortex Compound | "Infallible Mind" |
+
+All three now match on either name (additive -- the item's own name still
+works too, in case that's ever what actually applies). Elixir of Frost
+Power (v2.6.8) got the same defensive treatment ("Frost Power" added
+alongside "Elixir of Frost Power") since it's the same family of item and
+hasn't been confirmed in-game yet -- if it turns out unnecessary, it's
+harmless.
+
+**Changed (v2.6.10): weapon-enchant items now always show as missing for
+anyone but yourself, rather than being excluded from their checklist.**
+Follow-up to v2.6.9 below, after Waylock reported the same underlying
+symptom again: excluding an item from the checklist and silently assuming
+it's satisfied look identical on the roster (no missing icon either way),
+so v2.6.9 didn't actually fix what he was seeing -- a raider's row still
+read as fine regardless of whether they really had anything applied.
+Wizard Oil, Brilliant Wizard Oil, Elemental Sharpening Stone, and
+Brilliant Mana Oil now always count as missing for every raider except
+you when required, since there's genuinely no way to confirm one for
+anyone else. This does mean a raider who legitimately has one of these
+applied will still show as missing it -- an accepted tradeoff (erring
+toward "flag it" over "assume it's fine") given there's no API that could
+ever tell the two cases apart. Still checked normally against your own
+real weapon-enchant status, the one raider it's actually knowable for.
+
+**Fixed (v2.6.9, superseded by v2.6.10 above): a raider's row could read
+as having Wizard Oil (or the other weapon-enchant items) applied when
+they actually just had some unrelated weapon enchant on.** Reported by
+Waylock. Root cause: there's no 1.12 API to check anyone's weapon enchant
+but your own, so for every other raider the old code just silently
+assumed "satisfied" rather than flagging it missing -- which reads
+exactly like "confirmed has Wizard Oil" even though it's really "no
+idea." This version's fix (pulling the item out of a non-player raider's
+checklist entirely) turned out to look the same on screen as the original
+bug, hence v2.6.10 above.
+
+**Added (v2.6.8): a Mage's checklist now auto-detects which of Frost/Fire/
+Arcane Power they're running instead of expecting all three.** Elixir of
+Frost Power, Elixir of Greater Firepower, and Greater Arcane Elixir are
+mutually exclusive in practice -- a Mage only ever has the one matching
+their current build's damage school active, since a raid elixir only
+comes in "Frost" or "Fire" or "Arcane," never all three at once. All three
+are now checked as Mage defaults, but they're tied together as a "spec
+group" (`RaidConsumes_SpecGroups` in `Data.lua`): having ANY ONE of them
+detected on a raider stops the other two from being flagged missing for
+them, instead of (incorrectly) always showing 2 of the 3 as missing no
+matter which one they're actually running. Each elixir is still tracked
+completely separately -- its own icon, its own Usage-history count -- this
+just stops the false "missing" flags. Elixir of Frost Power (item ID
+17708) is a new item, confirmed against Wowhead Classic. This is scoped to
+the Mage checklist specifically for now, per Waylock's request -- Warlock
+and the generic Caster DPS role keep today's existing behavior (both
+Elixir of Greater Firepower and Greater Arcane Elixir checked
+independently, same as before).
+
+**Fixed (v2.6.6): opening or scrolling a checklist with a multi-category
+item on it (v2.6.5's Flask of the Titans/Dreamshard Elixir/etc. change,
+just above) could throw "attempt to index local 'item' (a nil value)" and
+error out**, confirmed by Ryan on the Warlock checklist specifically once
+scrolled past its first ~14 rows. Root cause: the game's own Lua runtime
+doesn't reliably handle a `for x in ipairs(someFunctionCall(...))` loop
+the same way the plain Lua this addon is tested under does -- the same
+underlying class of runtime quirk as the "category checkbox throws 'table
+index is nil'" bug fixed back in the per-category filtering work. The
+category-lookup code (`RaidConsumes_GetSortedItems` in `Data.lua`) is
+rewritten to use plain numeric loops instead, and Settings now also (1)
+never crashes outright even if a row somehow still comes back malformed --
+it just hides that one row -- and (2) wraps the class/role button click in
+the same safety net `RaidConsumes_ToggleSettings` already had, so any
+future rendering bug shows a chat error message instead of a raw Lua error
+box. If you still see anything odd on the checklist after this update,
+`/reload` and let me know exactly which class/role and roughly which
+scroll position.
+
 **Sync This Class** / **Sync All** push whatever's ticked out to your
 raid or party over the game's own addon-message channel, so everyone
 else running RaidConsumes ends up with the exact same checklist as you
@@ -179,6 +353,22 @@ The History window opens next to whichever of your other RaidConsumes
 windows is currently open -- to the right of Settings if Settings is
 open, otherwise to the right of the main window if that's open, otherwise
 centered on screen. (v2.6.3)
+
+**Clear-history prompt on entering a raid instance** (v2.6.4): zoning into
+Molten Core, Onyxia's Lair, Blackwing Lair, Zul'Gurub, Ruins of Ahn'Qiraj,
+Temple of Ahn'Qiraj, or Naxxramas pops a confirmation asking whether to
+clear your usage history for a fresh start -- so last raid night's counts
+don't linger into a new one just because you forgot to click Clear All
+History yourself. It only asks once per continuous stay in the zone (it
+won't re-ask every pull), and only actually clears anything if you click
+"Clear History" -- declining, or clicking away, leaves history untouched.
+There's no 1.12 API to detect "this is a raid instance" (that's a 2.0+
+concept), so this works the same way everything else in the addon does:
+by matching the zone's name. If OctoWoW ever adds a custom raid this list
+doesn't know about, add it yourself with `/rc raidzone add <exact zone
+name>` -- `/rc raidzone list` shows the current list, `/rc raidzone
+remove <exact zone name>` takes one off, and `/rc raidzone reset` restores
+the default 7.
 
 **Removed (v2.6.3): the "Missed" history view.** It logged once, the
 moment someone showed up in your group who wasn't there on your previous
@@ -331,6 +521,13 @@ rows never actually rendered, even though the data was there and being
 correctly tallied the whole time. Bumped to the same TOOLTIP-strata fix
 already applied to the main window and Settings rows.
 
+**Elixir of Shadow Power** (added in v2.6.4, per Waylock's report) was
+missing from the sheet's Caster DPS items entirely. It boosts Shadow
+damage specifically, so it's seeded only for Warlock's default checklist
+-- not Mage, and not the generic Caster DPS role -- since Balance Druids
+and Elemental Shamans don't do Shadow damage. Item ID (9264) confirmed
+against OctoWoW's own database.
+
 **Dreamshard Elixir** was missing from Mage/Warlock/Caster DPS's default
 checklist even though it's filed under the sheet's Healers column --
 OctoWoW's own item database confirms it's actually class-unrestricted
@@ -412,8 +609,11 @@ Drop the `RaidConsumes` folder into `Interface/AddOns/` and restart or
 ## Files
 
 - `RaidConsumes.toc` -- addon manifest / load order
-- `Data.lua` -- the editable item list (with item IDs, icons, categories),
-  and per-class/role defaults
+- `Data.lua` -- the editable item list (with item IDs, icons, categories --
+  optionally more than one via `extraCategories`, for items required by
+  multiple roles), per-class/role defaults, and `RaidConsumes_SpecGroups`
+  (items where having any one detected, like a Mage's Frost/Fire/Arcane
+  elixir, covers the rest of the group for a given profile)
 - `Scan.lua` -- roster scanning, buff-name matching (checks a buff's first
   two tooltip lines, and one matched name can satisfy more than one
   checklist item -- needed for shared generic buff names like "Well Fed"),
@@ -427,19 +627,26 @@ Drop the `RaidConsumes` folder into `Interface/AddOns/` and restart or
   item-icon tooltips validated against the live item data, and sync
   controls)
 - `History.lua` -- the Usage history window (who's popped what, how many
-  times), with a Clear All option and a CSV Export window
+  times), with a Clear All option, a CSV Export window, and the raid-zone
+  list + clear-history prompt for entering a raid instance
 - `Sync.lua` -- pushes/receives checklists over the raid/party addon-
   message channel ("Sync This Class" / "Sync All" in Settings, `/rc sync`)
 - `Minimap.lua` -- minimap button
 - `RaidConsumes.lua` -- SavedVariables init + slash commands (`/rc`,
-  `/rc check`, `/rc icon`, `/rc name`, `/rc sync`, `/rc debug`)
+  `/rc check`, `/rc icon`, `/rc name`, `/rc sync`, `/rc raidzone`, `/rc debug`),
+  and the `ZONE_CHANGED_NEW_AREA` handler that triggers the raid-entry
+  clear-history prompt
 - `test_scan.lua` -- a standalone logic + rendering test (name matching,
   class sorting, per-profile required defaults and isolation, missing-list
   computation, actual window/row rendering, icon resolution, reset-to-
   defaults, role overrides, class/role button coloring, per-category
-  checklist filtering and its toggles, `/rc name` overrides, `/rc debug`,
+  checklist filtering and its toggles, multi-category items, `/rc name`
+  overrides, `/rc debug`,
   weapon-enchant items, usage-history edge-detection, the History window,
-  checklist syncing including the trust checks, auto-check, and
-  auto-whisper), run with `lua5.1 test_scan.lua` outside the game (not
+  the raid-zone clear-history prompt, checklist syncing including the
+  trust checks, auto-check, auto-whisper, Mage spec-group elixir
+  detection, weapon-enchant items always flagging missing for non-player
+  raiders, and the v2.6.11/v2.6.12 buff-name audit fixes), run with `lua5.1
+  test_scan.lua` outside the game (not
   loaded in-game, not listed in the .toc). Useful if you extend `Data.lua`
   and want to sanity check the logic before hopping in-game.

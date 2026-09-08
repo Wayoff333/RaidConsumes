@@ -28,6 +28,7 @@ local function NewMock(frameType)
     function m:GetWidth() return self._width end
     function m:GetHeight() return self._height end
     function m:SetBackdrop() end
+    function m:SetBackdropColor(r, g, b, a) self._backdropColor = { r, g, b, a } end
     function m:SetMovable() end
     function m:EnableMouse() end
     function m:RegisterForDrag() end
@@ -102,13 +103,21 @@ local function NewMock(frameType)
 end
 
 -- ---- Fake raid roster ----
--- Waylock (Warlock): has his class-default caster items.
--- Aiden (Warrior): has his class-default items.
+-- Waylock (Warlock, the scanning player): has his class-default caster
+-- items, including his own weapon enchant (knowable, unlike everyone
+-- else's -- see the isWeaponEnchant tests below).
+-- Aiden (Warrior): has his class-default items by name, but a weapon-
+-- enchant item (Elemental Sharpening Stone) is required by the Warrior
+-- default -- unset in the tests below right after it's first proven so he
+-- can act as a clean "Ready" control raider elsewhere in this file (v2.6.10:
+-- unverifiable-for-him weapon-enchant items always flag missing otherwise).
 -- Brine (Warrior): has nothing.
--- Anahita (Priest): has everything except Flask of Distilled Wisdom.
+-- Anahita (Priest): has everything except Flask of Distilled Wisdom by
+-- name -- Brilliant Mana Oil is likewise unset after being first proven,
+-- for the same reason as Aiden's Elemental Sharpening Stone above.
 local fakeRoster = {
     raid1 = { name = "Waylock", class = "WARLOCK",
-        buffs = { "Flask of Supreme Power", "Greater Arcane Elixir", "Elixir of Greater Firepower", "Brilliant Wizard Oil", "Wizard Oil", "Dreamtonic", "Danonzo's Tel'Abim Delight" } },
+        buffs = { "Flask of Supreme Power", "Greater Arcane Elixir", "Elixir of Greater Firepower", "Brilliant Wizard Oil", "Wizard Oil", "Dreamtonic", "Danonzo's Tel'Abim Delight", "Dreamshard Elixir", "Elixir of Shadow Power", "Cerebral Cortex Compound" } },
     raid2 = { name = "Anahita", class = "PRIEST",
         buffs = { "Mageblood Potion", "Dreamshard Elixir", "Brilliant Mana Oil", "Medivh's Merlot Blue", "Nightfin Soup", "Cerebral Cortex Compound" } },
     raid3 = { name = "Brine", class = "WARRIOR",
@@ -193,11 +202,20 @@ _G.RAID_CLASS_COLORS = {
     MAGE = { r = 0.41, g = 0.8, b = 0.94 },
 }
 _G.FauxScrollFrame_Update = function() end
-_G.FauxScrollFrame_GetOffset = function() return 0 end
+-- Settable (via _G.__setSettingsScrollOffset) rather than hardcoded to 0 --
+-- a real v2.6.5 bug only showed up once a checklist was actually SCROLLED
+-- past its first ~14 rows, and a mock that always reports offset 0 would
+-- silently miss that entire class of bug again. See the "full-scroll
+-- regression" test below.
+local fakeScrollOffset = 0
+_G.__setSettingsScrollOffset = function(n) fakeScrollOffset = n end
+_G.FauxScrollFrame_GetOffset = function() return fakeScrollOffset end
 _G.FauxScrollFrame_OnVerticalScroll = function() end
 
 local fakeRaidCount = 4 -- mutable so the join-detection tests can simulate someone joining/leaving
 _G.GetNumRaidMembers = function() return activeRoster == fakeRoster and fakeRaidCount or 0 end
+local fakeZoneText = "Ironforge" -- mutable so the raid-zone-entry tests can simulate zoning around
+_G.GetRealZoneText = function() return fakeZoneText end
 _G.GetNumPartyMembers = function() return 0 end
 _G.UnitExists = function(u) return activeRoster[u] ~= nil end
 _G.UnitName = function(u)
@@ -252,16 +270,41 @@ _G.GetWeaponEnchantInfo = function() return true end
 _G.time = function() return 123456 end
 _G.date = function(fmt, t) return "12:34:56" end
 _G.GetItemIcon = function(id) return id and ("Interface\\Icons\\FakeIcon" .. tostring(id)) or nil end
+-- Test-only stand-in for the real GetItemInfo: returns the label of
+-- whichever known item currently has this itemID, mimicking "this itemID
+-- really does belong to the item we mean" the way a real, correctly-ID'd
+-- server would. A test can set _G.__itemInfoOverrides[id] to a DIFFERENT
+-- name to simulate the actual OctoWoW bug -- a hardcoded itemID that
+-- belongs to some other item on this particular server -- and to nil to
+-- simulate the item not being cached client-side yet.
+_G.__itemInfoOverrides = {}
+_G.GetItemInfo = function(id)
+    if not id then return nil end
+    if _G.__itemInfoOverrides[id] ~= nil then
+        return _G.__itemInfoOverrides[id] or nil
+    end
+    for _, item in ipairs(RaidConsumes_Items or {}) do
+        if item.itemID == id then
+            return item.label
+        end
+    end
+    return nil
+end
 _G.StaticPopupDialogs = {}
 _G.StaticPopup_Show = function(name) _G.__lastStaticPopupShown = name end
 
-RaidConsumesDB = { required = {}, syncEnabled = true, autoScanEnabled = false, autoScanInterval = 5, autoWhisperEnabled = false, autoWhisperCooldown = 300 }
+RaidConsumesDB = { required = {}, syncEnabled = true, autoScanEnabled = false, autoScanInterval = 5, autoWhisperEnabled = false, autoWhisperCooldown = 300, hideReadyPlayers = false, windowOpacity = 100 }
 
 dofile("Data.lua")
 dofile("Scan.lua")
 dofile("UI.lua")
 dofile("History.lua")
 dofile("Sync.lua")
+
+-- Mimics the ADDON_LOADED seeding RaidConsumes.lua does in-game (not
+-- loaded by this test harness) so RaidConsumesDB.raidZoneNames exists
+-- before the raid-zone-entry tests run, same as every other DB default.
+RaidConsumes_ResetRaidZonesToDefault()
 
 local function check(cond, msg)
     if cond then
@@ -286,22 +329,50 @@ check(rows[4].entry.name == "Waylock", "row 4 is the Warlock")
 local byName = {}
 for _, r in ipairs(rows) do byName[r.entry.name] = r end
 
-check(table.getn(byName["Aiden"].missing) == 0, "Aiden (Warrior) has everything from the Warrior default list")
-check(table.getn(byName["Waylock"].missing) == 0, "Waylock (Warlock) has everything from the Warlock default list")
+-- Aiden has every Warrior default item popped BY NAME, but Elemental
+-- Sharpening Stone is a weapon-enchant item -- v2.6.10 always flags those
+-- missing for anyone but the scanning player, since there's no way to
+-- ever verify one for another raider. So Aiden is missing exactly that
+-- one item, not fully Ready, even though everything else checks out.
+check(table.getn(byName["Aiden"].missing) == 1, "Aiden (Warrior) is missing exactly one item")
+check(byName["Aiden"].missing[1] == "Elemental Sharpening Stone", "Aiden's one miss is specifically Elemental Sharpening Stone (unverifiable for a non-player raider)")
+check(table.getn(byName["Waylock"].missing) == 0, "Waylock (Warlock, the scanning player) has everything from the Warlock default list -- his own weapon enchant IS knowable")
 check(table.getn(byName["Brine"].missing) > 0, "Brine (Warrior, nothing popped) is missing items")
 
--- Anahita (Priest) is missing only Flask of Distilled Wisdom from the Priest default list.
+-- Anahita (Priest) is missing Flask of Distilled Wisdom from the Priest
+-- default list by name, PLUS Brilliant Mana Oil -- another weapon-enchant
+-- item, always flagged missing for her (not the scanning player) per
+-- v2.6.10 even though "Brilliant Mana Oil" is right there in her fake
+-- buff list (that buff-name match is irrelevant for an isWeaponEnchant
+-- item -- see the isWeaponEnchant comment in Data.lua).
 local anahitaMissing = byName["Anahita"].missing
-check(table.getn(anahitaMissing) == 1, "Anahita is missing exactly 1 required item")
-check(anahitaMissing[1] == "Flask of Distilled Wisdom", "Anahita is specifically missing Flask of Distilled Wisdom")
+check(table.getn(anahitaMissing) == 2, "Anahita is missing exactly 2 required items")
+local anahitaHasFlaskMiss, anahitaHasOilMiss = false, false
+for _, label in ipairs(anahitaMissing) do
+    if label == "Flask of Distilled Wisdom" then anahitaHasFlaskMiss = true end
+    if label == "Brilliant Mana Oil" then anahitaHasOilMiss = true end
+end
+check(anahitaHasFlaskMiss, "Anahita is specifically missing Flask of Distilled Wisdom")
+check(anahitaHasOilMiss, "Anahita is also flagged missing Brilliant Mana Oil, unverifiable for a non-player raider regardless of her buff list")
+
+-- Brilliant Mana Oil is never reset elsewhere in this file (unlike
+-- Elemental Sharpening Stone above) -- untoggled once here so Anahita
+-- stays a clean "missing just Flask of Distilled Wisdom" control raider
+-- for the rest of the file.
+RaidConsumes_EnsureRequiredDefaults("PRIEST").brilliantManaOil = false
 
 -- Per-class isolation: toggling a requirement for WARRIOR must not affect PRIEST's list.
 local warriorReq = RaidConsumes_EnsureRequiredDefaults("WARRIOR")
-warriorReq.elementalSharpeningStone = false -- Aiden already had this; untoggling shouldn't change his (still 0) missing count
+-- Elemental Sharpening Stone can never be cleared for Aiden (not the
+-- scanning player) no matter what he pops -- untoggling the requirement
+-- entirely is the only way to stop it from always being flagged missing
+-- for him. Left off for the rest of the file so Aiden can go back to
+-- being a clean "has everything" control raider for later tests.
+warriorReq.elementalSharpeningStone = false
 local rows2 = RaidConsumes_ComputeDisplayRows()
 local byName2 = {}
 for _, r in ipairs(rows2) do byName2[r.entry.name] = r end
-check(table.getn(byName2["Aiden"].missing) == 0, "Untoggling a satisfied item doesn't create a false miss")
+check(table.getn(byName2["Aiden"].missing) == 0, "unrequiring an unverifiable-for-him weapon-enchant item clears Aiden's only miss")
 
 local priestReq = RaidConsumes_EnsureRequiredDefaults("PRIEST")
 check(priestReq.elementalSharpeningStone == false, "Priest's required table is independent of Warrior's (not seeded with that item at all)")
@@ -319,30 +390,88 @@ end
 check(hasFlaskMissing, "Brine is specifically flagged missing 'Flask of the Titans'")
 
 -- Category -> subcategory -> alphabetical sort for the Settings checklist.
+-- RaidConsumes_GetSortedItems() returns one WRAPPED { item, category,
+-- subcategory } entry per (item, category) pair -- an item required by
+-- more than one role (extraCategories in Data.lua) gets more than one
+-- entry, so the sorted list is longer than the master item list by
+-- exactly the total number of extraCategories across all items.
 local sortedItems = RaidConsumes_GetSortedItems()
-check(table.getn(sortedItems) == table.getn(RaidConsumes_Items), "sorted list has the same item count as the master list")
+local expectedEntryCount = 0
+for _, item in ipairs(RaidConsumes_Items) do
+    expectedEntryCount = expectedEntryCount + 1 + (item.extraCategories and table.getn(item.extraCategories) or 0)
+end
+check(table.getn(sortedItems) == expectedEntryCount, "sorted list has one entry per (item, category) pair -- the master item count plus one extra entry per extraCategories item")
 
 local catRankOf, subRankOf = {}, {}
 for i, cat in ipairs(RaidConsumes_CategoryOrder) do catRankOf[cat] = i end
 for i, sub in ipairs(RaidConsumes_SubcategoryOrder) do subRankOf[sub] = i end
 local lastCatRank, prevCategory, prevSub, prevLabel = 0, nil, nil, nil
 local orderOk = true
-for _, item in ipairs(sortedItems) do
-    local catRank = catRankOf[item.category] or 999
+for _, entry in ipairs(sortedItems) do
+    local catRank = catRankOf[entry.category] or 999
     if catRank < lastCatRank then orderOk = false end
-    if item.category == prevCategory then
-        local subRank = subRankOf[item.subcategory] or 999
+    if entry.category == prevCategory then
+        local subRank = subRankOf[entry.subcategory] or 999
         local prevSubRank = subRankOf[prevSub] or 999
         if subRank < prevSubRank then orderOk = false end
-        if item.subcategory == prevSub and prevLabel and item.label < prevLabel then orderOk = false end
+        if entry.subcategory == prevSub and prevLabel and entry.item.label < prevLabel then orderOk = false end
     end
     lastCatRank = catRank
-    prevCategory = item.category
-    prevSub = item.subcategory
-    prevLabel = item.label
+    prevCategory = entry.category
+    prevSub = entry.subcategory
+    prevLabel = entry.item.label
 end
 check(orderOk, "sorted items are grouped by category, then subcategory (Flask/Food Buff/General/Other), then alphabetical by label")
 check(sortedItems[1].category == "Tanks", "first sorted item is in the Tanks category")
+check(sortedItems[1].item.key ~= nil, "each sorted entry wraps the real item under .item")
+
+-- ===================== multi-category items (shared across role sections) =====================
+-- Some items are default-required for more than one role -- these should
+-- appear, fully interactive, under EACH relevant category in the Settings
+-- checklist instead of being buried under just their primary one (Ryan's
+-- request). RaidConsumes_GetSortedItems() does this by returning more than
+-- one entry for such an item, each wrapping the exact SAME item table (so
+-- there's still only one real "required" checkbox behind all of them).
+local function EntriesForKey(key)
+    local matches = {}
+    for _, entry in ipairs(sortedItems) do
+        if entry.item.key == key then table.insert(matches, entry) end
+    end
+    return matches
+end
+
+local flaskTitansEntries = EntriesForKey("flaskTitans")
+check(table.getn(flaskTitansEntries) == 2, "Flask of the Titans appears under exactly 2 categories")
+check(flaskTitansEntries[1].category == "Tanks", "Flask of the Titans' first entry is under Tanks (its primary category)")
+check(flaskTitansEntries[2].category == "Physical DPS", "Flask of the Titans' second entry is under Physical DPS")
+check(flaskTitansEntries[1].item == flaskTitansEntries[2].item, "both entries wrap the exact same item table -- one real checkbox, not two independent ones")
+
+for _, key in ipairs({ "elixirMongoose", "elixirGiants", "jujuPower", "groundScorpokAssay" }) do
+    local entries = EntriesForKey(key)
+    check(table.getn(entries) == 2, RaidConsumes_ItemByKey[key].label .. " appears under exactly 2 categories (Tanks and Physical DPS)")
+    local cats = { entries[1].category, entries[2].category }
+    check((cats[1] == "Tanks" and cats[2] == "Physical DPS") or (cats[1] == "Physical DPS" and cats[2] == "Tanks"),
+        RaidConsumes_ItemByKey[key].label .. "'s two entries are Tanks and Physical DPS")
+end
+
+local shardEntries = EntriesForKey("dreamshardElixir")
+check(table.getn(shardEntries) == 2, "Dreamshard Elixir appears under exactly 2 categories")
+check(shardEntries[1].category == "Healers" and shardEntries[2].category == "Caster DPS",
+    "Dreamshard Elixir's entries are Healers (primary) then Caster DPS (extra)")
+
+local stoneEntries = EntriesForKey("elementalSharpeningStone")
+check(table.getn(stoneEntries) == 2, "Elemental Sharpening Stone appears under exactly 2 categories")
+-- Its primary category is Physical DPS (extraCategories adds Tanks), but
+-- the sorted list orders by RaidConsumes_CategoryOrder overall (Tanks
+-- ranks before Physical DPS), so the Tanks entry comes first here --
+-- primary-vs-extra only decides item.category (its own single "home"
+-- category elsewhere), not this list's ordering.
+check(stoneEntries[1].category == "Tanks" and stoneEntries[2].category == "Physical DPS",
+    "Elemental Sharpening Stone's entries appear Tanks-then-Physical-DPS (category rank order, not declaration order)")
+
+-- Sanity control: an ordinary item with no extraCategories still appears
+-- exactly once -- multi-category is opt-in per item, not a blanket change.
+check(table.getn(EntriesForKey("roids")) == 1, "R.O.I.D.S. (no extraCategories) still appears under exactly 1 category")
 
 -- ===================== rendering tests (the real bug-catchers) =====================
 -- These actually invoke RaidConsumes_RefreshList() / RaidConsumes_ToggleSettings()
@@ -402,27 +531,27 @@ end
 RaidConsumes_ScanRaid()
 RaidConsumes_RefreshList()
 local totalItemCount = table.getn(RaidConsumes_Items)
--- Weapon-enchant items (Wizard Oil and friends) are never flagged missing
--- for anyone but the scanning player -- see isWeaponEnchant -- so Brine
--- (not the player) has all of them silently excluded from his missing
--- count even though he's required for and doesn't have any of them.
-local weaponEnchantCount = 0
-for _, item in ipairs(RaidConsumes_Items) do
-    if RaidConsumes_ItemRequiresWeaponEnchant(item) then
-        weaponEnchantCount = weaponEnchantCount + 1
-    end
-end
-local expectedMissing = totalItemCount - weaponEnchantCount
+-- Weapon-enchant items (Wizard Oil and friends) are ALWAYS flagged missing
+-- for anyone but the scanning player (v2.6.10 -- can never be verified for
+-- them, so the addon errs toward over-flagging), so Brine (not the player)
+-- is missing every single required item here, weapon-enchant ones included.
+local expectedMissing = totalItemCount
 check(totalItemCount > 12, "sanity check: there are more than 12 total items to test icon overflow with")
 check(_G.RaidConsumesRow2.missingIcons[12]:IsShown() == true, "all 12 icon slots are used when missing more than 12 items")
 check(_G.RaidConsumesRow2.missingMoreText:IsShown() == true, "a '+N' label appears when missing more than 12 items")
-check(_G.RaidConsumesRow2.missingMoreText:GetText() == "+" .. (expectedMissing - 12), "'+N' reflects exactly how many items didn't fit in the icon row (weapon-enchant items excluded, unknowable for a non-player raider)")
+check(_G.RaidConsumesRow2.missingMoreText:GetText() == "+" .. (expectedMissing - 12), "'+N' reflects exactly how many items didn't fit in the icon row (weapon-enchant items count as missing for a non-player raider too, v2.6.10)")
 -- The names line is capped by character count (not item count) so it can
 -- never wrap into the row below -- with this many missing, it must end in
 -- a "+N more" summary rather than trying to spell out every single name.
 check(string.find(_G.RaidConsumesRow2.missingNamesText:GetText(), " more$") ~= nil,
     "the names line falls back to a '+N more' summary when the full list would be too long to show")
 RaidConsumes_ResetProfileToDefaults("WARRIOR")
+-- Resetting restores the real seeded default, including Elemental
+-- Sharpening Stone -- which per v2.6.10 always reads as missing for
+-- Aiden (not the scanning player). Untoggled again so Aiden stays a
+-- clean "has everything" control raider for the rest of this file, same
+-- as right after the initial scan above.
+RaidConsumes_EnsureRequiredDefaults("WARRIOR").elementalSharpeningStone = false
 RaidConsumes_ScanRaid()
 RaidConsumes_RefreshList()
 
@@ -456,6 +585,24 @@ check(_G.RaidConsumesSettingRow3.headerText:IsShown() == false, "Settings row 3 
 check(_G.RaidConsumesSettingRow4.headerText:GetText() == "Food Buff", "Settings row 4 is the 'Food Buff' subcategory header")
 check(_G.RaidConsumesSettingRow5.label:GetText() == "Dirge's Kickin' Chimaerok Chops", "Settings row 5 is the first Food Buff item alphabetically")
 
+-- Toggling a multi-category item's checkbox here (under Tanks) must flip
+-- the ONE real required flag behind it -- there's no separate flag per
+-- category, just one row's-worth of `required` state that every entry for
+-- this item reads/writes -- and the click handler refreshes Settings (not
+-- just the main window) so a second occurrence elsewhere in the same
+-- scrolled checklist (Physical DPS, in this case, just scrolled off the
+-- pooled rows in this mock) would immediately show the same new state too.
+local warriorReqForToggle = RaidConsumes_EnsureRequiredDefaults("WARRIOR")
+check(warriorReqForToggle.flaskTitans == true, "Flask of the Titans starts checked for Warrior (seeded default)")
+check(_G.RaidConsumesSettingRow3.check:GetChecked() == true, "the rendered Tanks-section checkbox for Flask of the Titans starts checked, matching the default")
+_G.RaidConsumesSettingCheck3:SetChecked(false)
+_G.RaidConsumesSettingCheck3:GetScript("OnClick")()
+check(warriorReqForToggle.flaskTitans == false, "unchecking the Tanks-section checkbox clears the single shared required flag")
+_G.RaidConsumesSettingCheck3:SetChecked(true)
+_G.RaidConsumesSettingCheck3:GetScript("OnClick")()
+check(warriorReqForToggle.flaskTitans == true, "re-checking it sets the shared flag back to true")
+check(_G.RaidConsumesSettingRow3.check:GetChecked() == true, "Settings re-renders correctly (no error) after a multi-category item's checkbox click")
+
 -- Icon resolution: itemID-bearing items pull their icon live via GetItemIcon;
 -- items without one fall back to the guessed icon string.
 check(_G.RaidConsumesSettingRow3.icon.texture:GetTexture() == "Interface\\Icons\\FakeIcon13510", "Flask of the Titans icon resolves via GetItemIcon(itemID)")
@@ -470,6 +617,33 @@ check(RaidConsumesDB.iconOverrides.flaskTitans == 99999, "icon override is persi
 -- whatever item last occupied that pooled row.
 check(_G.RaidConsumesSettingRow3.icon.itemLabel == "Flask of the Titans", "item row's icon carries its item label for the hover tooltip")
 check(_G.RaidConsumesSettingRow1.icon.itemLabel == nil, "header row's icon has no stale item label")
+
+-- Icon MISMATCH protection: the real OctoWoW bug -- a hardcoded itemID
+-- (sourced from a different item database) happens to belong to a
+-- COMPLETELY DIFFERENT item on this particular server, so GetItemIcon
+-- doesn't fail, it just confidently returns the WRONG real icon. The live
+-- item name is checked against the item's label before the icon is
+-- trusted; a mismatch falls back to the guessed icon string instead.
+do
+    RaidConsumesDB.iconOverrides.flaskTitans = nil -- clear the override set above so itemID resolution is actually exercised
+    _G.__itemInfoOverrides[13510] = "Thistle Tea" -- pretend itemID 13510 is actually a totally different item on this server
+    RaidConsumes_RefreshSettings()
+    check(_G.RaidConsumesSettingRow3.icon.texture:GetTexture() == RaidConsumes_ItemByKey.flaskTitans.icon,
+        "a mismatched live item name falls back to the guessed icon instead of showing the wrong item's real icon")
+
+    _G.__itemInfoOverrides[13510] = false -- simulate the item not being cached client-side yet (GetItemInfo returns nil)
+    RaidConsumes_RefreshSettings()
+    check(_G.RaidConsumesSettingRow3.icon.texture:GetTexture() == RaidConsumes_ItemByKey.flaskTitans.icon,
+        "an uncached itemID (GetItemInfo returns nil) also falls back to the guessed icon rather than guessing")
+
+    _G.__itemInfoOverrides[13510] = nil -- restore normal (name-matching) resolution
+    RaidConsumes_RefreshSettings()
+    check(_G.RaidConsumesSettingRow3.icon.texture:GetTexture() == "Interface\\Icons\\FakeIcon13510",
+        "once the live name actually matches again, the real itemID icon is trusted as normal")
+
+    RaidConsumesDB.iconOverrides.flaskTitans = 99999 -- put the earlier /rc icon override back so nothing after this is perturbed
+    RaidConsumes_RefreshSettings()
+end
 
 -- R.O.I.D.S. (the sheet's alternate Strength potion alongside Ground Scorpok
 -- Assay): registered, resolves its icon via itemID, matched by its actual
@@ -579,6 +753,40 @@ _G.this = nil
 check(_G.RaidConsumesCategoryToggle1:GetChecked() ~= true, "Tanks checkbox is unchecked again after a second click")
 check(RaidConsumes_GetVisibleCategories()["Tanks"] == nil, "Tanks category is hidden again after unchecking")
 
+-- ===================== full-scroll regression (v2.6.5 in-game crash) =====================
+-- Ryan hit "RaidConsumes\UI.lua:1506: attempt to index local 'item' (a nil
+-- value)" in RaidConsumes_RefreshSettings, in-game, on the Warlock
+-- checklist -- but ONLY once he actually scrolled it past the first ~14
+-- rows. Every test above (including one that already selected WARLOCK)
+-- only ever inspected RaidConsumesSettingRow1-5, and the FauxScrollFrame
+-- mock always reported offset 0 -- so this whole class of bug was
+-- completely invisible to this suite until now. Root cause: the game's
+-- own Lua runtime doesn't reliably handle a generic `for x in
+-- ipairs(SomeFunctionCall(...))` loop the same way lua5.1 does (same
+-- family of issue as the "this.category" comment on the category toggle
+-- buttons above) -- RaidConsumes_GetSortedItems in Data.lua was rewritten
+-- to use plain numeric for-loops instead, and this test scrolls every
+-- offset of every class/role's checklist to prove it (and to catch any
+-- future regression of the same kind, in-suite, without needing to be
+-- in-game to find it).
+do
+    local allProfiles = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID", "TANK", "HEALER", "PHYSDPS", "CASTERDPS" }
+    for _, profile in ipairs(allProfiles) do
+        local selectOk = pcall(RaidConsumes_SelectSettingsClass, profile)
+        check(selectOk, "selecting " .. profile .. " in Settings doesn't error")
+        local total = table.getn(RaidConsumes_GetSortedItems())
+        local scrollOk = true
+        for offset = 0, total do
+            _G.__setSettingsScrollOffset(offset)
+            local ok = pcall(RaidConsumes_RefreshSettings)
+            if not ok then scrollOk = false end
+        end
+        check(scrollOk, "scrolling every offset (0.." .. total .. ") of " .. profile .. "'s checklist renders without error")
+    end
+    _G.__setSettingsScrollOffset(0)
+    RaidConsumes_SelectSettingsClass("WARLOCK")
+end
+
 -- Reset to Defaults: dirty the Warrior list, reset, confirm it's back to seed.
 local warriorReqBefore = RaidConsumes_EnsureRequiredDefaults("WARRIOR")
 warriorReqBefore.flaskTitans = false
@@ -587,6 +795,13 @@ RaidConsumes_ResetProfileToDefaults("WARRIOR")
 local warriorReqAfter = RaidConsumes_EnsureRequiredDefaults("WARRIOR")
 check(warriorReqAfter.flaskTitans == true, "Reset to Defaults restores a default-on item that had been unchecked")
 check(warriorReqAfter.dreamtonic == false, "Reset to Defaults clears an item that isn't actually a Warrior default")
+check(warriorReqAfter.elementalSharpeningStone == true, "Reset to Defaults restores Elemental Sharpening Stone too, a genuine Warrior default")
+
+-- Untoggled again (same reasoning as after the very first reset above) so
+-- Aiden stays a clean "has everything" control raider for the rest of
+-- this file -- otherwise v2.6.10 would flag him permanently missing this
+-- one unverifiable-for-him item from here on.
+warriorReqAfter.elementalSharpeningStone = false
 
 RaidConsumes_ToggleSettings()
 check(_G.RaidConsumesSettingsFrame:IsShown() == false, "Settings window closes on a second ToggleSettings call")
@@ -624,8 +839,16 @@ check(brineRowFrame.roleBtn.text._r == warriorClassColor.r and brineRowFrame.rol
 -- Confirmed via Ryan's own screenshots: temporary weapon enchants never
 -- show up via UnitBuff scanning in vanilla at all -- the enchant only shows
 -- as an extra line on the WEAPON's own tooltip. isWeaponEnchant items are
--- satisfied instead via GetWeaponEnchantInfo() (self-only), and must never
--- be flagged missing for anyone but the scanning player.
+-- satisfied instead via GetWeaponEnchantInfo(), which only ever reports
+-- the SCANNING PLAYER's own weapon -- there is no API for anyone else's.
+--
+-- v2.6.10 (after v2.6.9's "exclude entirely" didn't actually fix what
+-- Waylock reported -- a raider's row still read as fine either way,
+-- since "excluded" and "assumed satisfied" look identical with no missing
+-- icon): for anyone but the scanning player, these items are now ALWAYS
+-- flagged missing when required, since there's no way to ever confirm
+-- one either way. Only the scanning player, via the real
+-- GetWeaponEnchantInfo() result, can ever clear one.
 do
     -- Give the scanning player (Waylock) a Warlock/Caster requirement he'd
     -- otherwise fail by name alone, then strip the buff-name text so the
@@ -645,15 +868,98 @@ do
     check(waylockRow ~= nil, "sanity check: Waylock's row is found for the weapon-enchant test")
     check(waylockRow.missingText:GetText() == "Ready", "Waylock still shows 'Ready' with no Wizard Oil buff BY NAME -- satisfied via weaponBuff instead")
 
-    -- Aiden (not the scanning player) genuinely has no weapon enchant text
-    -- either, and his Warrior default requires Elemental Sharpening Stone
-    -- -- but it must be silently excluded (never flagged), not shown missing,
-    -- since weapon-enchant status is unknowable for anyone but the player.
-    local aidenRow = FindRowByPlayerName("Aiden")
-    check(aidenRow ~= nil, "sanity check: Aiden's row is found for the weapon-enchant test")
-    check(aidenRow.missingText:GetText() == "Ready", "Aiden shows 'Ready' -- Elemental Sharpening Stone is never flagged missing for a non-player raider")
-
     fakeRoster.raid1.buffs = savedBuffs
+    RaidConsumes_ScanRaid()
+    RaidConsumes_RefreshList()
+end
+
+-- ===================== weapon-enchant items always flagged missing for
+-- non-player raiders (v2.6.10) =====================
+-- Reported by Waylock, twice: another raider's row read as fine for
+-- Wizard Oil when they really had nothing, or some unrelated enchant --
+-- first because the old code assumed "satisfied" for anyone but the
+-- scanning player (pre-v2.6.9), then because "excluded entirely" (v2.6.9)
+-- looks exactly the same on the roster (no missing icon either way).
+-- Confirmed here even in the most generous case for the old behavior --
+-- every raider's mocked GetWeaponEnchantInfo() genuinely reporting an
+-- enchant present -- Aiden must still be flagged missing, since
+-- weaponBuffKnown is only ever true for the scanning player regardless of
+-- what GetWeaponEnchantInfo() itself returns.
+do
+    -- Toggling GetWeaponEnchantInfo() below and re-scanning would otherwise
+    -- create a spurious not-had -> has usage-history transition for
+    -- Waylock's shared weapon-enchant bucket, throwing off the "exactly
+    -- one use logged" checks further down this file -- save and restore
+    -- his history/edge-detection state so this block has zero side effects
+    -- on that unrelated feature.
+    local savedWaylockHistory = {}
+    if RaidConsumesDB.usageHistory["Waylock"] then
+        for k, v in pairs(RaidConsumesDB.usageHistory["Waylock"]) do savedWaylockHistory[k] = v end
+    end
+    local savedWaylockLastHits = {}
+    if RaidConsumes_LastHitsByPlayer and RaidConsumes_LastHitsByPlayer["Waylock"] then
+        for k, v in pairs(RaidConsumes_LastHitsByPlayer["Waylock"]) do savedWaylockLastHits[k] = v end
+    end
+
+    -- Re-enable Elemental Sharpening Stone for Warrior just for this
+    -- block (it's left off elsewhere in the file so Aiden can act as a
+    -- clean control raider -- see the earlier unset, right after the
+    -- initial scan).
+    local warriorReqForTest = RaidConsumes_EnsureRequiredDefaults("WARRIOR")
+    warriorReqForTest.elementalSharpeningStone = true
+
+    local savedGetWeaponEnchantInfo = _G.GetWeaponEnchantInfo
+    _G.GetWeaponEnchantInfo = function() return true end -- as if EVERYONE had one
+    RaidConsumes_ScanRaid()
+    RaidConsumes_RefreshList()
+    local aidenRow = FindRowByPlayerName("Aiden")
+    check(aidenRow.missingText:IsShown() == false, "Aiden is flagged missing something (Elemental Sharpening Stone), so his 'Ready' text is hidden, even with GetWeaponEnchantInfo() mocked to report one present for everyone")
+    local rowsDataAllEnchanted = RaidConsumes_ComputeDisplayRows()
+    local aidenMissingAllEnchanted = nil
+    for _, r in ipairs(rowsDataAllEnchanted) do
+        if r.entry.name == "Aiden" then aidenMissingAllEnchanted = r.missing end
+    end
+    local aidenFlaggedStone = false
+    for _, label in ipairs(aidenMissingAllEnchanted) do
+        if label == "Elemental Sharpening Stone" then aidenFlaggedStone = true end
+    end
+    check(aidenFlaggedStone, "Aiden IS flagged missing Elemental Sharpening Stone -- unverifiable for him regardless of what GetWeaponEnchantInfo() itself reports")
+
+    -- The scanning player (Waylock) is the one raider this CAN actually be
+    -- checked for -- when he genuinely has neither Wizard Oil/Brilliant
+    -- Wizard Oil by name nor a weapon enchant reported, he IS flagged
+    -- missing it too, same as Aiden -- proving the scanning player isn't
+    -- somehow exempt, just that his status is the one that's knowable.
+    _G.GetWeaponEnchantInfo = function() return false end
+    local savedWaylockBuffs = fakeRoster.raid1.buffs
+    local strippedWaylockBuffs = {}
+    for _, b in ipairs(savedWaylockBuffs) do
+        if b ~= "Wizard Oil" and b ~= "Brilliant Wizard Oil" then
+            table.insert(strippedWaylockBuffs, b)
+        end
+    end
+    fakeRoster.raid1.buffs = strippedWaylockBuffs
+    RaidConsumes_ScanRaid()
+    RaidConsumes_RefreshList()
+    local waylockRowNoEnchant = FindRowByPlayerName("Waylock")
+    check(waylockRowNoEnchant.missingText:IsShown() == false, "Waylock's 'Ready' text is hidden once he's flagged missing something (icons shown instead)")
+    local rowsDataNoEnchant = RaidConsumes_ComputeDisplayRows()
+    local waylockMissingItemsNoEnchant = nil
+    for _, r in ipairs(rowsDataNoEnchant) do
+        if r.entry.name == "Waylock" then waylockMissingItemsNoEnchant = r.missingItems end
+    end
+    local foundOilMissing = false
+    for _, it in ipairs(waylockMissingItemsNoEnchant) do
+        if it.key == "brilliantWizardOil" or it.key == "wizardOil" then foundOilMissing = true end
+    end
+    check(foundOilMissing, "the scanning player's own missing weapon enchant IS flagged (Wizard Oil/Brilliant Wizard Oil)")
+
+    fakeRoster.raid1.buffs = savedWaylockBuffs
+    _G.GetWeaponEnchantInfo = savedGetWeaponEnchantInfo
+    RaidConsumesDB.usageHistory["Waylock"] = savedWaylockHistory
+    RaidConsumes_LastHitsByPlayer["Waylock"] = savedWaylockLastHits
+    -- Restore Aiden to a clean control raider for the rest of the file.
+    warriorReqForTest.elementalSharpeningStone = false
     RaidConsumes_ScanRaid()
     RaidConsumes_RefreshList()
 end
@@ -665,13 +971,15 @@ for _, r in ipairs(rowsAfterOverride) do if r.entry.name == "Brine" then brineMi
 local healerReq = RaidConsumes_EnsureRequiredDefaults("HEALER")
 local expectedHealerMissCount = 0
 for key, required in pairs(healerReq) do
-    -- Weapon-enchant items (e.g. Brilliant Mana Oil) are never flagged
-    -- missing for a non-player raider like Brine -- see isWeaponEnchant.
-    if required and not (RaidConsumes_ItemByKey[key] and RaidConsumes_ItemRequiresWeaponEnchant(RaidConsumes_ItemByKey[key])) then
+    -- Weapon-enchant items (e.g. Brilliant Mana Oil) ARE flagged missing
+    -- for a non-player raider like Brine too (v2.6.10) -- never knowable
+    -- for him, so the addon errs toward over-flagging rather than
+    -- silently assuming satisfied.
+    if required then
         expectedHealerMissCount = expectedHealerMissCount + 1
     end
 end
-check(table.getn(brineMissingAsHealer) == expectedHealerMissCount, "Brine overridden to HEALER is checked against the Healer list, not the Warrior list (misses every required Healer item since he popped nothing, except weapon-enchant items which are never flagged for a non-player raider)")
+check(table.getn(brineMissingAsHealer) == expectedHealerMissCount, "Brine overridden to HEALER is checked against the Healer list, not the Warrior list (misses every required Healer item since he popped nothing, weapon-enchant items included)")
 RaidConsumesDB.roleOverride["Brine"] = nil
 
 -- Physical DPS and Caster DPS are separate profiles (not one shared "DPS"
@@ -689,15 +997,11 @@ RaidConsumesDB.roleOverride["Brine"] = "PHYSDPS"
 local rowsAsPhys = RaidConsumes_ComputeDisplayRows()
 local brineMissingAsPhys = nil
 for _, r in ipairs(rowsAsPhys) do if r.entry.name == "Brine" then brineMissingAsPhys = r.missing end end
--- Weapon-enchant items are never flagged missing for a non-player raider
--- like Brine -- see isWeaponEnchant -- so they're excluded from both
--- expected counts below (Physical DPS has 1: Elemental Sharpening Stone;
--- Caster DPS has 2: Brilliant Wizard Oil, Wizard Oil).
-local function IsNotWeaponEnchant(key)
-    return not (RaidConsumes_ItemByKey[key] and RaidConsumes_ItemRequiresWeaponEnchant(RaidConsumes_ItemByKey[key]))
-end
+-- Weapon-enchant items ARE flagged missing for a non-player raider like
+-- Brine too (v2.6.10), so they're included in both expected counts below,
+-- same as every other required item.
 local expectedPhysMissCount = 0
-for key, required in pairs(physReq) do if required and IsNotWeaponEnchant(key) then expectedPhysMissCount = expectedPhysMissCount + 1 end end
+for key, required in pairs(physReq) do if required then expectedPhysMissCount = expectedPhysMissCount + 1 end end
 check(table.getn(brineMissingAsPhys) == expectedPhysMissCount, "Brine overridden to PHYSDPS is checked against Physical DPS's list")
 
 RaidConsumesDB.roleOverride["Brine"] = "CASTERDPS"
@@ -705,9 +1009,13 @@ local rowsAsCaster = RaidConsumes_ComputeDisplayRows()
 local brineMissingAsCaster = nil
 for _, r in ipairs(rowsAsCaster) do if r.entry.name == "Brine" then brineMissingAsCaster = r.missing end end
 local expectedCasterMissCount = 0
-for key, required in pairs(casterReq) do if required and IsNotWeaponEnchant(key) then expectedCasterMissCount = expectedCasterMissCount + 1 end end
+for key, required in pairs(casterReq) do if required then expectedCasterMissCount = expectedCasterMissCount + 1 end end
 check(table.getn(brineMissingAsCaster) == expectedCasterMissCount, "Brine overridden to CASTERDPS is checked against Caster DPS's list")
-check(expectedPhysMissCount ~= expectedCasterMissCount, "sanity check: Physical and Caster DPS actually require a different number of items with the seeded defaults")
+-- (Physical DPS and Caster DPS's default lists genuinely differ -- already
+-- proven directly above by elixirMongoose/dreamtonic being on one list and
+-- not the other. Their TOTAL counts can coincidentally match depending on
+-- what's seeded on each side -- e.g. both gained one same-sized addition
+-- in v2.6.7 -- so an equal count here is not itself a bug.)
 
 -- The role button's own text for an active PHYSDPS/CASTERDPS override reads
 -- "Phys"/"Cast" -- real words like Tank/Heal, not an acronym like the old
@@ -836,9 +1144,22 @@ check(RaidConsumesDB.usageHistoryClass["Aiden"] == "WARRIOR", "Aiden's class is 
 -- Usage tab instead of never being logged (a real gap that would have
 -- looked just like "history isn't showing anything" for exactly the two
 -- items that report they're actually being used).
+--
+-- GetWeaponEnchantInfo() can only report whether SOME main-hand enchant
+-- is active, never which one -- so Wizard Oil, Brilliant Wizard Oil,
+-- Elemental Sharpening Stone, and Brilliant Mana Oil are logged as ONE
+-- shared bucket (RaidConsumes_WEAPON_ENCHANT_HISTORY_KEY), not as 4
+-- separate item counts. Confirmed via a real report: popping a single
+-- Wizard Oil was inflating all 4 real items' counts to match.
 check(RaidConsumesDB.usageHistory["Waylock"] ~= nil, "Waylock (the scanning player) has recorded usage history")
-check(RaidConsumesDB.usageHistory["Waylock"]["wizardOil"] == 1, "Wizard Oil use is logged via weaponBuff even though it never shows up by name in the real game")
-check(RaidConsumesDB.usageHistory["Waylock"]["brilliantWizardOil"] == 1, "Brilliant Wizard Oil use is logged via weaponBuff the same way")
+check(RaidConsumesDB.usageHistory["Waylock"][RaidConsumes_WEAPON_ENCHANT_HISTORY_KEY] == 1,
+    "one weapon-enchant use is logged once, in the shared bucket, even though the scanning player has both Wizard Oil and Brilliant Wizard Oil required")
+check(RaidConsumesDB.usageHistory["Waylock"]["wizardOil"] == nil,
+    "the real Wizard Oil item key itself is never credited -- it can't be told apart from the other 3 weapon-enchant items")
+check(RaidConsumesDB.usageHistory["Waylock"]["brilliantWizardOil"] == nil,
+    "the real Brilliant Wizard Oil item key itself is never credited either, for the same reason")
+check(RaidConsumesDB.usageHistory["Waylock"]["elementalSharpeningStone"] == nil,
+    "Elemental Sharpening Stone (not even on the Warlock default list) is never credited from Waylock's weapon buff")
 
 -- Re-scanning once more must not inflate an already-active buff's count.
 RaidConsumes_ScanRaid()
@@ -895,6 +1216,221 @@ check(next(RaidConsumesDB.usageHistory) == nil, "confirming the popup clears all
 
 RaidConsumes_ToggleHistory()
 check(_G.RaidConsumesHistoryFrame:IsShown() == false, "History window closes")
+
+-- ===================== Elixir of Shadow Power (Warlock addition) =====================
+-- Added per Waylock's report that it was missing from the sheet's Caster
+-- DPS items -- boosts Shadow damage specifically, so it's seeded only for
+-- Warlock, not Mage or the generic Caster DPS role (Balance Druids and
+-- Elemental Shamans don't do Shadow damage).
+check(RaidConsumes_ItemByKey.elixirShadowPower ~= nil, "Elixir of Shadow Power is a registered item")
+check(RaidConsumes_ItemByKey.elixirShadowPower.itemID == 9264, "Elixir of Shadow Power has the correct item ID")
+check(RaidConsumes_ItemByKey.elixirShadowPower.category == "Caster DPS", "Elixir of Shadow Power is filed under Caster DPS")
+check(GetItemIcon(RaidConsumes_ItemByKey.elixirShadowPower.itemID) == "Interface\\Icons\\FakeIcon9264", "Elixir of Shadow Power icon resolves via GetItemIcon(itemID)")
+local shadowPowerWarlockReq = RaidConsumes_EnsureRequiredDefaults("WARLOCK")
+local shadowPowerMageReq = RaidConsumes_EnsureRequiredDefaults("MAGE")
+local shadowPowerCasterReq = RaidConsumes_EnsureRequiredDefaults("CASTERDPS")
+check(shadowPowerWarlockReq.elixirShadowPower == true, "Elixir of Shadow Power is a Warlock default")
+check(not shadowPowerMageReq.elixirShadowPower, "Elixir of Shadow Power is NOT a Mage default (Mages don't do Shadow damage)")
+check(not shadowPowerCasterReq.elixirShadowPower, "Elixir of Shadow Power is NOT a generic Caster DPS default (not every caster role does Shadow damage)")
+
+-- ===================== Elixir of Frost Power (Mage spec-group addition, v2.6.8) =====================
+-- Added so a Mage's Frost/Fire/Arcane elixir can be auto-detected instead
+-- of assumed -- item ID and buff name confirmed via Wowhead Classic
+-- (wowhead.com/classic/item=17708). See the spec-group behavioral tests
+-- above (the Zephyr block) for the "any one satisfies the group" logic.
+check(RaidConsumes_ItemByKey.elixirFrostPower ~= nil, "Elixir of Frost Power is a registered item")
+check(RaidConsumes_ItemByKey.elixirFrostPower.itemID == 17708, "Elixir of Frost Power has the correct item ID")
+check(RaidConsumes_ItemByKey.elixirFrostPower.category == "Caster DPS", "Elixir of Frost Power is filed under Caster DPS")
+check(GetItemIcon(RaidConsumes_ItemByKey.elixirFrostPower.itemID) == "Interface\\Icons\\FakeIcon17708", "Elixir of Frost Power icon resolves via GetItemIcon(itemID)")
+local frostPowerMageReq = RaidConsumes_EnsureRequiredDefaults("MAGE")
+local frostPowerWarlockReq = RaidConsumes_EnsureRequiredDefaults("WARLOCK")
+local frostPowerCasterReq = RaidConsumes_EnsureRequiredDefaults("CASTERDPS")
+check(frostPowerMageReq.elixirFrostPower == true, "Elixir of Frost Power is a Mage default")
+check(not frostPowerWarlockReq.elixirFrostPower, "Elixir of Frost Power is NOT a Warlock default (scoped to Mage per Waylock's request)")
+check(not frostPowerCasterReq.elixirFrostPower, "Elixir of Frost Power is NOT a generic Caster DPS default (scoped to Mage per Waylock's request)")
+
+-- Spec-group registration itself (Data.lua) -- the group exists, contains
+-- all three elixirs, and is scoped to MAGE only.
+local frostPowerGroupForMage = RaidConsumes_GetSpecGroupFor("elixirFrostPower", "MAGE")
+check(frostPowerGroupForMage ~= nil, "Elixir of Frost Power belongs to a spec group for the MAGE profile")
+check(frostPowerGroupForMage ~= nil and table.getn(frostPowerGroupForMage) == 3, "the Mage spec group has exactly 3 members")
+check(RaidConsumes_GetSpecGroupFor("elixirGreaterFirepower", "MAGE") ~= nil, "Elixir of Greater Firepower is also in the Mage spec group")
+check(RaidConsumes_GetSpecGroupFor("greaterArcaneElixir", "MAGE") ~= nil, "Greater Arcane Elixir is also in the Mage spec group")
+check(RaidConsumes_GetSpecGroupFor("elixirFrostPower", "WARLOCK") == nil, "the spec group does NOT apply to the Warlock profile")
+check(RaidConsumes_GetSpecGroupFor("elixirFrostPower", "CASTERDPS") == nil, "the spec group does NOT apply to the generic Caster DPS profile")
+check(RaidConsumes_GetSpecGroupFor("flaskSupremePower", "MAGE") == nil, "an unrelated item (Flask of Supreme Power) has no spec group")
+
+-- ===================== buff-name mismatches confirmed via Waylock's own
+-- /rc debug output (v2.6.11) =====================
+-- Reported by Waylock: Flask of Supreme Power and Elixir of Shadow Power
+-- weren't detecting for him even with both genuinely active. His own
+-- /rc debug output showed why -- same class of mismatch as
+-- R.O.I.D.S./"Rage of Ages": the actual applied buff names are "Supreme
+-- Power" and "Shadow Power", dropping the "Flask of"/"Elixir of" prefix
+-- entirely. His debug output also caught a THIRD unmatched buff --
+-- "Infallible Mind" / "Increases Intellect by 25." -- which is Cerebral
+-- Cortex Compound's real buff name, same story. All three now match by
+-- either name (additive, the item's own label still matches too).
+check(RaidConsumes_ItemByKey.flaskSupremePower.names[1] == "Flask of Supreme Power", "Flask of Supreme Power still matches its own item name first")
+check(RaidConsumes_ItemByKey.flaskSupremePower.names[2] == "Supreme Power", "Flask of Supreme Power also matches its real, shorter buff name")
+check(RaidConsumes_ItemByKey.elixirShadowPower.names[2] == "Shadow Power", "Elixir of Shadow Power also matches its real, shorter buff name")
+check(RaidConsumes_ItemByKey.cerebralCortexCompound.names[2] == "Infallible Mind", "Cerebral Cortex Compound also matches its real, unrelated-sounding buff name")
+
+do
+    -- Behavioral proof, not just data: Waylock (raid1/player) pops ONLY
+    -- the short buff names his own /rc debug output actually showed --
+    -- never the full item names -- and all three still register as
+    -- detected, not missing.
+    local savedBuffs = fakeRoster.raid1.buffs
+    fakeRoster.raid1.buffs = { "Supreme Power", "Shadow Power", "Infallible Mind" }
+    RaidConsumes_ScanRaid()
+    local rowsDataShortNames = RaidConsumes_ComputeDisplayRows()
+    local waylockMissingShortNames = nil
+    for _, r in ipairs(rowsDataShortNames) do
+        if r.entry.name == "Waylock" then waylockMissingShortNames = r.missingItems end
+    end
+    local function IsMissingKey(items, key)
+        for _, it in ipairs(items) do
+            if it.key == key then return true end
+        end
+        return false
+    end
+    check(not IsMissingKey(waylockMissingShortNames, "flaskSupremePower"), "Flask of Supreme Power detected from the buff named only 'Supreme Power'")
+    check(not IsMissingKey(waylockMissingShortNames, "elixirShadowPower"), "Elixir of Shadow Power detected from the buff named only 'Shadow Power'")
+    check(not IsMissingKey(waylockMissingShortNames, "cerebralCortexCompound"), "Cerebral Cortex Compound detected from the buff named only 'Infallible Mind'")
+
+    fakeRoster.raid1.buffs = savedBuffs
+    RaidConsumes_ScanRaid()
+    RaidConsumes_RefreshList()
+end
+
+-- ===================== full-list buff-name audit (v2.6.12) =====================
+-- Prompted by Waylock: "other flasks are not counting either." Researched
+-- every Flask/Elixir/Potion item against Wowhead Classic spell data
+-- (cross-checked against classicdb.ch and a live buff-tracking addon's
+-- GetSpellInfo() table -- see README.md for the full audit results,
+-- including which items were confirmed correct and which are still
+-- unconfirmed). Each mismatch below gets its real buff name added
+-- ADDITIVELY (the item's own name still matches too, in case that's ever
+-- what actually applies) -- structural check only, that both names are
+-- present; the earlier Shadow Power/Supreme Power/Infallible Mind block
+-- above already proves the underlying detection mechanism works from a
+-- short name alone.
+local function NamesContain(item, name)
+    for _, n in ipairs(item.names) do
+        if n == name then return true end
+    end
+    return false
+end
+local audit12 = {
+    { key = "elixirSuperiorDefense", altName = "Greater Armor" },
+    { key = "greaterStoneshieldPotion", altName = "Greater Stoneshield" },
+    { key = "elixirGiants", altName = "Elixir of the Giants" },
+    { key = "groundScorpokAssay", altName = "Strike of the Scorpok" },
+    { key = "majorTrollsBloodPotion", altName = "Regeneration" },
+    { key = "magebloodPotion", altName = "Mana Regeneration" },
+    { key = "flaskDistilledWisdom", altName = "Distilled Wisdom" },
+    { key = "elixirGreaterFirepower", altName = "Greater Firepower" },
+    { key = "limitedInvulnerabilityPotion", altName = "Invulnerability" },
+}
+for _, a in ipairs(audit12) do
+    local item = RaidConsumes_ItemByKey[a.key]
+    check(item ~= nil, a.key .. " is a registered item")
+    check(item ~= nil and NamesContain(item, item.label), a.key .. " still matches its own item name")
+    check(item ~= nil and NamesContain(item, a.altName), a.key .. " also matches its real buff name (\"" .. a.altName .. "\")")
+end
+
+-- Confirmed correct as-is (no code change) -- re-verified via 3
+-- independent sources during the same audit pass.
+check(NamesContain(RaidConsumes_ItemByKey.flaskTitans, "Flask of the Titans") and table.getn(RaidConsumes_ItemByKey.flaskTitans.names) == 1,
+    "Flask of the Titans genuinely matches its own item name -- re-confirmed, no change needed")
+check(NamesContain(RaidConsumes_ItemByKey.potionOfQuickness, "Potion of Quickness") and table.getn(RaidConsumes_ItemByKey.potionOfQuickness.names) == 1,
+    "Potion of Quickness genuinely matches its own item name on Turtle WoW -- no change needed")
+
+-- Deliberately NOT auto-fixed -- see the code comments in Data.lua for why:
+-- Elixir of Fortitude's suspected "Health II" is too low-confidence/generic
+-- to add blind (needs a live /rc debug spot-check first).
+check(table.getn(RaidConsumes_ItemByKey.elixirFortitude.names) == 1, "Elixir of Fortitude is untouched pending live confirmation (see Data.lua comment)")
+
+-- Major Healing Potion / Major Mana Potion are structurally undetectable
+-- (instant effects, no buff aura at all) -- confirm they're still off by
+-- default everywhere so this limitation has no real-world bite unless
+-- someone opts in deliberately.
+for _, profile in ipairs({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID", "TANK", "HEALER", "PHYSDPS", "CASTERDPS" }) do
+    local req = RaidConsumes_EnsureRequiredDefaults(profile)
+    check(not req.majorHealingPotion, "Major Healing Potion (undetectable) is not a default for " .. profile)
+    check(not req.majorManaPotion, "Major Mana Potion (undetectable) is not a default for " .. profile)
+end
+
+-- ===================== Cerebral Cortex Compound (v2.6.7, multi-category addition) =====================
+-- Per Waylock's report that it was "hiding under Healers" on the Warlock
+-- checklist -- it's an Intellect potion useful to any caster, not just
+-- healers, so (same treatment as Dreamshard Elixir) it now also shows
+-- under Caster DPS and is seeded as a Mage/Warlock/Caster DPS default too,
+-- on top of its existing Priest/Druid/Healer defaults.
+check(RaidConsumes_ItemByKey.cerebralCortexCompound ~= nil, "Cerebral Cortex Compound is a registered item")
+check(RaidConsumes_ItemByKey.cerebralCortexCompound.category == "Healers", "Cerebral Cortex Compound's primary category is still Healers")
+local cortexEntries = EntriesForKey("cerebralCortexCompound")
+check(table.getn(cortexEntries) == 2, "Cerebral Cortex Compound appears under exactly 2 categories")
+check(cortexEntries[1].category == "Healers" and cortexEntries[2].category == "Caster DPS",
+    "Cerebral Cortex Compound's entries are Healers (primary) then Caster DPS (extra)")
+
+local cortexWarlockReq = RaidConsumes_EnsureRequiredDefaults("WARLOCK")
+local cortexMageReq = RaidConsumes_EnsureRequiredDefaults("MAGE")
+local cortexCasterReq = RaidConsumes_EnsureRequiredDefaults("CASTERDPS")
+local cortexPriestReq = RaidConsumes_EnsureRequiredDefaults("PRIEST")
+local cortexDruidReq = RaidConsumes_EnsureRequiredDefaults("DRUID")
+local cortexHealerReq = RaidConsumes_EnsureRequiredDefaults("HEALER")
+check(cortexWarlockReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is now a Warlock default")
+check(cortexMageReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is now a Mage default")
+check(cortexCasterReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is now a Caster DPS default")
+check(cortexPriestReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is still a Priest default")
+check(cortexDruidReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is still a Druid default")
+check(cortexHealerReq.cerebralCortexCompound == true, "Cerebral Cortex Compound is still a Healer role default")
+
+-- ===================== clear-history prompt on entering a raid instance =====================
+-- Per Waylock's request: no 1.12 API for "is this a raid instance" exists,
+-- so this is done by matching GetRealZoneText() against a known list of
+-- raid zone names (RaidConsumes_MaybePromptClearHistoryForZone -- normally
+-- called from RaidConsumes.lua's ZONE_CHANGED_NEW_AREA handler, exercised
+-- here directly since the test harness doesn't load RaidConsumes.lua).
+check(RaidConsumes_IsRaidZoneName("Molten Core") == true, "Molten Core is a known raid zone by default")
+check(RaidConsumes_IsRaidZoneName("Onyxia's Lair") == true, "Onyxia's Lair is a known raid zone by default")
+check(RaidConsumes_IsRaidZoneName("Ironforge") == false, "a regular city is not treated as a raid zone")
+check(RaidConsumes_IsRaidZoneName(nil) == false, "a nil zone name doesn't error and isn't treated as a raid zone")
+
+_G.__lastStaticPopupShown = nil
+RaidConsumes_MaybePromptClearHistoryForZone("Ironforge")
+check(_G.__lastStaticPopupShown == nil, "zoning into a non-raid zone never shows the clear-history prompt")
+
+RaidConsumes_MaybePromptClearHistoryForZone("Molten Core")
+check(_G.__lastStaticPopupShown == "RAIDCONSUMES_CLEAR_HISTORY_ZONE", "zoning into a known raid instance shows the clear-history prompt")
+
+_G.__lastStaticPopupShown = nil
+RaidConsumes_MaybePromptClearHistoryForZone("Molten Core")
+check(_G.__lastStaticPopupShown == nil, "staying in the same raid zone (e.g. moving between trash pulls) doesn't re-prompt")
+
+RaidConsumes_MaybePromptClearHistoryForZone("Ironforge")
+_G.__lastStaticPopupShown = nil
+RaidConsumes_MaybePromptClearHistoryForZone("Molten Core")
+check(_G.__lastStaticPopupShown == "RAIDCONSUMES_CLEAR_HISTORY_ZONE", "leaving and re-entering the raid zone prompts again")
+
+RaidConsumesDB.usageHistory = { Waylock = { flaskTitans = 3 } }
+StaticPopupDialogs["RAIDCONSUMES_CLEAR_HISTORY_ZONE"].OnAccept()
+check(next(RaidConsumesDB.usageHistory) == nil, "accepting the raid-entry prompt clears usage history, same as Clear All History")
+
+-- customizing the raid zone list in-game (the /rc raidzone add/remove/reset
+-- commands in RaidConsumes.lua call these same functions directly)
+check(RaidConsumes_AddRaidZone("Emerald Sanctum") == true, "adding a new custom raid zone succeeds")
+check(RaidConsumes_IsRaidZoneName("Emerald Sanctum") == true, "the newly-added zone is now recognized")
+check(RaidConsumes_AddRaidZone("Emerald Sanctum") == false, "adding a zone that's already on the list is a no-op (returns false)")
+check(RaidConsumes_RemoveRaidZone("Emerald Sanctum") == true, "removing a zone that's on the list succeeds")
+check(RaidConsumes_IsRaidZoneName("Emerald Sanctum") == false, "the removed zone is no longer recognized")
+check(RaidConsumes_RemoveRaidZone("Emerald Sanctum") == false, "removing a zone that isn't on the list is a no-op (returns false)")
+RaidConsumes_AddRaidZone("Emerald Sanctum")
+RaidConsumes_ResetRaidZonesToDefault()
+check(RaidConsumes_IsRaidZoneName("Emerald Sanctum") == false, "resetting the raid zone list drops any custom additions")
+check(RaidConsumes_IsRaidZoneName("Naxxramas") == true, "resetting the raid zone list restores the default 7 vanilla raids")
 
 -- ===================== checklist sync (Sync.lua) =====================
 -- Fires the real CHAT_MSG_ADDON event through FireEvent rather than only
@@ -1021,88 +1557,106 @@ _G.__sentMessages = {}
 FireEvent("CHAT_MSG_ADDON", "RCsync", "REQSYNC", "RAID", "Waylock")
 check(table.getn(_G.__sentMessages) == 0, "doesn't respond to a REQSYNC that echoes back from yourself")
 
--- ===================== missed-consumable history (join detection) =====================
+-- ===================== a new raider joins mid-raid (Zephyr) =====================
 -- A new raider ("Zephyr") isn't in the roster yet -- adding him and
--- bumping the raid count simulates him joining mid-raid. The first scan
--- that sees him should log a "missed" entry for everything currently
--- required of Mages that he doesn't have (edge-detected the same way
--- usage is, just for "present in the raid" instead of "has the buff") --
--- and a second scan right after, while he's still there, must NOT log it
--- again.
-local mageReq = RaidConsumes_EnsureRequiredDefaults("MAGE")
-local expectedMissedKeys = {}
-for _, item in ipairs(RaidConsumes_Items) do
-    -- Weapon-enchant items (Wizard Oil and friends) are never knowable for
-    -- anyone but the scanning player, so they can never be logged as
-    -- "missed" for another raider like Zephyr either -- same isWeaponEnchant
-    -- reasoning as the missing-list and usage-history tests above.
-    if mageReq[item.key] and not RaidConsumes_ItemRequiresWeaponEnchant(item) then table.insert(expectedMissedKeys, item.key) end
-end
-check(table.getn(expectedMissedKeys) > 0, "Mage currently requires at least one item (sanity check for this test)")
-
+-- bumping the raid count simulates him joining mid-raid. He pops nothing,
+-- so he should never show up in the Usage view (v2.6.3 removed the old
+-- "Missed" view entirely -- it was based on presence edge-detection alone
+-- and wasn't reliably accurate; Usage, what's actually been popped, is).
 fakeRoster.raid5 = { name = "Zephyr", class = "MAGE", buffs = {} } -- pops nothing
 fakeRaidCount = 5
 RaidConsumes_ScanRaid()
-local zephyrMissed = RaidConsumesDB.missedHistory["Zephyr"]
-check(zephyrMissed ~= nil, "a raider who just appeared in the raid gets a missed-history entry")
-local allLoggedOnce = true
-for _, key in ipairs(expectedMissedKeys) do
-    if zephyrMissed[key] ~= 1 then allLoggedOnce = false end
-end
-check(allLoggedOnce, "every currently-required Mage item Zephyr is missing gets logged once on join")
 
-RaidConsumes_ScanRaid() -- re-scan while Zephyr is still in the raid, still missing the same things
-local stillOnce = true
-for _, key in ipairs(expectedMissedKeys) do
-    if zephyrMissed[key] ~= 1 then stillOnce = false end
-end
-check(stillOnce, "re-scanning the same raid does NOT log the miss again (once per join, not once per click)")
-
--- Zephyr leaves (removed from the roster), then rejoins later in the same
--- session -- that's a fresh join and should log again.
-fakeRoster.raid5 = nil
-fakeRaidCount = 4
-RaidConsumes_ScanRaid()
-fakeRoster.raid5 = { name = "Zephyr", class = "MAGE", buffs = {} }
-fakeRaidCount = 5
-RaidConsumes_ScanRaid()
-check(zephyrMissed[expectedMissedKeys[1]] == 2, "leaving and rejoining the raid logs a fresh miss")
-
--- The History window's "Missed" view surfaces this; the "Usage" view is
--- unaffected -- Zephyr never popped anything, so he shouldn't appear there.
-RaidConsumes_ToggleHistory() -- opens (starts on the "Usage" view)
-local usageRows = RaidConsumes_GetHistoryRows("usage")
+RaidConsumes_ToggleHistory() -- opens
+local usageRows = RaidConsumes_GetHistoryRows()
 local zephyrInUsage = false
 for _, r in ipairs(usageRows) do
     if r.name == "Zephyr" then zephyrInUsage = true end
 end
 check(not zephyrInUsage, "a raider who never popped anything doesn't show up in the Usage view")
-
-_G.RaidConsumesHistoryViewButton:GetScript("OnClick")()
-local missedRows = RaidConsumes_GetHistoryRows()
-local zephyrMissedRow = nil
-for _, r in ipairs(missedRows) do
-    if r.name == "Zephyr" then zephyrMissedRow = r end
-end
-check(zephyrMissedRow ~= nil, "Zephyr shows up in the Missed view after switching to it")
-check(zephyrMissedRow.count == 2, "Zephyr's Missed-view count matches the 2 logged joins")
-
--- Export follows the currently-shown view (Missed, from the toggle above)
--- and its header/column name reflects that.
-local missedExportText = RaidConsumes_BuildHistoryExportText("missed")
-check(string.find(missedExportText, "^Player,Item,Missed") ~= nil, "missed export starts with a Player,Item,Missed header")
-check(string.find(missedExportText, "Zephyr," .. zephyrMissedRow.label .. ",2", 1, true) ~= nil,
-    "missed export contains Zephyr's logged-twice item at the right count")
-_G.RaidConsumesHistoryExportButton:GetScript("OnClick")()
-check(_G.RaidConsumesExportEditBox:GetText() == missedExportText, "the export box picks up the Missed view's text when that's what's showing")
-_G.RaidConsumesExportFrame:Hide()
-
 RaidConsumes_ToggleHistory() -- close
 
--- Clearing history only wipes the currently-shown view, not both.
-check(next(RaidConsumesDB.missedHistory) ~= nil, "missedHistory has data before clearing")
-StaticPopupDialogs["RAIDCONSUMES_CLEAR_HISTORY"].OnAccept() -- historyViewMode is "missed" from the toggle above
-check(next(RaidConsumesDB.missedHistory) == nil, "clearing history while on the Missed view wipes missedHistory")
+-- ===================== Mage spec-group elixirs (v2.6.8) =====================
+-- Frost/Fire/Arcane are mutually exclusive on a real Mage -- only ONE of
+-- these elixirs is ever active on a given Mage at a time, since which one
+-- they run depends on their current build. RaidConsumes_SpecGroups
+-- (Data.lua) must stop the other two from being falsely flagged missing
+-- once ANY ONE is detected, while a Mage popping NONE of them still gets
+-- flagged for all three like any other missing item. Zephyr (raid5, MAGE)
+-- from the block above is reused here.
+--
+-- MAGE's required set was overwritten earlier in this file (the incoming
+-- sync test above sets it to exactly {flaskTitans, elementalSharpeningStone})
+-- -- reset it back to its seeded defaults so this block tests the real
+-- starting checklist, not whatever a previous test left behind.
+RaidConsumes_ResetProfileToDefaults("MAGE")
+
+local function LabelsContain(labels, label)
+    for i = 1, table.getn(labels) do
+        if labels[i] == label then
+            return true
+        end
+    end
+    return false
+end
+
+local function MissingLabelsForName(name)
+    local rowsData = RaidConsumes_ComputeDisplayRows()
+    for _, rowData in ipairs(rowsData) do
+        if rowData.entry.name == name then
+            return rowData.missing
+        end
+    end
+    return nil
+end
+
+fakeRoster.raid5.buffs = {}
+RaidConsumes_ScanRaid()
+local zephyrLabelsNone = MissingLabelsForName("Zephyr")
+check(zephyrLabelsNone ~= nil, "sanity check: Zephyr has a row after scanning")
+check(LabelsContain(zephyrLabelsNone, "Elixir of Frost Power"), "popping nothing: Elixir of Frost Power is flagged missing")
+check(LabelsContain(zephyrLabelsNone, "Elixir of Greater Firepower"), "popping nothing: Elixir of Greater Firepower is flagged missing")
+check(LabelsContain(zephyrLabelsNone, "Greater Arcane Elixir"), "popping nothing: Greater Arcane Elixir is flagged missing")
+
+fakeRoster.raid5.buffs = { "Elixir of Frost Power" }
+RaidConsumes_ScanRaid()
+local zephyrLabelsFrost = MissingLabelsForName("Zephyr")
+check(not LabelsContain(zephyrLabelsFrost, "Elixir of Frost Power"), "Frost Power detected: not flagged missing itself")
+check(not LabelsContain(zephyrLabelsFrost, "Elixir of Greater Firepower"), "Frost Power detected: Greater Firepower is NOT falsely flagged missing (spec group)")
+check(not LabelsContain(zephyrLabelsFrost, "Greater Arcane Elixir"), "Frost Power detected: Greater Arcane Elixir is NOT falsely flagged missing (spec group)")
+
+fakeRoster.raid5.buffs = { "Elixir of Greater Firepower" }
+RaidConsumes_ScanRaid()
+local zephyrLabelsFire = MissingLabelsForName("Zephyr")
+check(not LabelsContain(zephyrLabelsFire, "Elixir of Frost Power"), "Firepower detected: Frost Power is NOT falsely flagged missing (spec group)")
+check(not LabelsContain(zephyrLabelsFire, "Elixir of Greater Firepower"), "Firepower detected: not flagged missing itself")
+check(not LabelsContain(zephyrLabelsFire, "Greater Arcane Elixir"), "Firepower detected: Greater Arcane Elixir is NOT falsely flagged missing (spec group)")
+
+fakeRoster.raid5.buffs = { "Greater Arcane Elixir" }
+RaidConsumes_ScanRaid()
+local zephyrLabelsArcane = MissingLabelsForName("Zephyr")
+check(not LabelsContain(zephyrLabelsArcane, "Elixir of Frost Power"), "Arcane Elixir detected: Frost Power is NOT falsely flagged missing (spec group)")
+check(not LabelsContain(zephyrLabelsArcane, "Elixir of Greater Firepower"), "Arcane Elixir detected: Greater Firepower is NOT falsely flagged missing (spec group)")
+check(not LabelsContain(zephyrLabelsArcane, "Greater Arcane Elixir"), "Arcane Elixir detected: not flagged missing itself")
+
+-- Scoped to Mage only, per Waylock's "just Mage for now" -- a raider
+-- overridden to the CASTERDPS role (a Balance Druid, say) still gets
+-- Greater Arcane Elixir flagged missing even with Firepower popped, since
+-- RaidConsumes_SpecGroups only lists "MAGE" in its profiles.
+RaidConsumesDB.roleOverride["Brine"] = "CASTERDPS"
+local savedBrineBuffs = fakeRoster.raid3.buffs
+fakeRoster.raid3.buffs = { "Elixir of Greater Firepower" }
+RaidConsumes_ScanRaid()
+local brineLabels = MissingLabelsForName("Brine")
+check(brineLabels ~= nil and LabelsContain(brineLabels, "Greater Arcane Elixir"),
+    "spec-group grouping is scoped to Mage only -- a Caster DPS role override still gets Greater Arcane Elixir flagged missing even with Firepower popped")
+RaidConsumesDB.roleOverride["Brine"] = nil
+fakeRoster.raid3.buffs = savedBrineBuffs
+RaidConsumes_ScanRaid()
+
+-- Zephyr pops nothing again for whatever runs after this block.
+fakeRoster.raid5.buffs = {}
+RaidConsumes_ScanRaid()
 
 -- ===================== auto-check =====================
 -- Off by default, and the checkbox/interval box reflect RaidConsumesDB
@@ -1275,5 +1829,108 @@ do
     RaidConsumes_LastMissingSet = {}
     _G.__sentWhispers = {}
 end
+
+-- ===================== window opacity (v2.6.0) =====================
+-- One EditBox drives both windows' alpha; garbage/out-of-range input
+-- clamps and falls back the same way the auto-check/auto-whisper boxes do.
+check(RaidConsumesDB.windowOpacity == 100, "window opacity defaults to 100")
+RaidConsumes_RefreshOpacityControls()
+check(_G.RaidConsumesOpacityBox:GetText() == "100", "opacity box starts showing the default 100")
+
+RaidConsumes_ApplyWindowOpacity("50")
+check(RaidConsumesDB.windowOpacity == 50, "typing a valid opacity saves it")
+check(_G.RaidConsumesOpacityBox:GetText() == "50", "the box reflects the accepted value")
+check(_G.RaidConsumesFrame:GetAlpha() == 0.5, "the main window's alpha reflects the new opacity")
+check(_G.RaidConsumesSettingsFrame:GetAlpha() == 0.5, "the Settings window's alpha reflects the new opacity too")
+
+RaidConsumes_ApplyWindowOpacity("5")
+check(RaidConsumesDB.windowOpacity == 20, "an opacity below the 20 floor is clamped up to it")
+check(_G.RaidConsumesFrame:GetAlpha() == 0.2, "the clamped floor value is actually applied to the window")
+
+RaidConsumes_ApplyWindowOpacity("500")
+check(RaidConsumesDB.windowOpacity == 100, "an opacity above the 100 ceiling is clamped down to it")
+
+RaidConsumes_ApplyWindowOpacity("banana")
+check(RaidConsumesDB.windowOpacity == 100, "non-numeric garbage falls back to whatever was already saved, not an error or a silent no-op")
+
+-- Back to fully opaque so nothing looks broken for the rest of the suite.
+RaidConsumes_ApplyWindowOpacity("100")
+check(_G.RaidConsumesFrame:GetAlpha() == 1, "opacity restored to fully opaque")
+
+-- ===================== "only show not ready" filter (v2.6.0) =====================
+-- Purely a display filter -- hides Ready rows from the roster list, but
+-- summaryText's "X of Y" counts must still reflect the TRUE, unfiltered
+-- roster (checked via RaidConsumes_ComputeDisplayRows directly, since the
+-- mocked FauxScrollFrame_Update doesn't capture its arguments).
+RaidConsumesDB.hideReadyPlayers = false
+RaidConsumes_RefreshHideReadyControl()
+check(_G.RaidConsumesHideReadyCheck:GetChecked() ~= true, "hide-ready checkbox starts unchecked, matching the default")
+
+RaidConsumes_ScanRaid()
+RaidConsumes_RefreshList()
+local waylockRowUnfiltered = FindRowByPlayerName("Waylock")
+check(waylockRowUnfiltered ~= nil and waylockRowUnfiltered:IsShown() == true, "with the filter off, a Ready raider's row is shown")
+local _, unfilteredTotal, unfilteredReadyCount = RaidConsumes_ComputeDisplayRows()
+
+_G.this = _G.RaidConsumesHideReadyCheck
+_G.RaidConsumesHideReadyCheck:SetChecked(true)
+_G.RaidConsumesHideReadyCheck:GetScript("OnClick")()
+_G.this = nil
+check(RaidConsumesDB.hideReadyPlayers == true, "checking the box turns the filter on and re-renders the list")
+
+-- Waylock (Ready, the scanning player) must now be hidden. His row frame's
+-- playerName field is only ever set when a row actually renders him, so
+-- once filtered out it keeps its stale value from the last unfiltered
+-- render -- IsShown() is therefore the real signal, not "row not found".
+local waylockRowFiltered = FindRowByPlayerName("Waylock")
+check(waylockRowFiltered == nil or waylockRowFiltered:IsShown() == false, "with the filter on, a Ready raider's row is hidden")
+
+local brineRowFiltered = FindRowByPlayerName("Brine")
+check(brineRowFiltered ~= nil and brineRowFiltered:IsShown() == true, "a not-ready raider's row still shows with the filter on")
+
+local _, filteredTotal, filteredReadyCount = RaidConsumes_ComputeDisplayRows()
+check(filteredTotal == unfilteredTotal and filteredReadyCount == unfilteredReadyCount,
+    "RaidConsumes_ComputeDisplayRows still reports the true full-roster counts regardless of the display filter")
+
+-- Reset so the filter doesn't stay on for whatever runs after this block.
+RaidConsumesDB.hideReadyPlayers = false
+RaidConsumes_RefreshHideReadyControl()
+RaidConsumes_RefreshList()
+
+-- ===================== Send Whisper Now (v2.6.0) =====================
+-- Immediately whispers every raider currently missing something,
+-- bypassing auto-whisper's cooldown/edge-detection entirely -- an
+-- explicit on-demand nag rather than the automatic re-nag loop. Uses the
+-- real scanned roster (not injectable rows like RaidConsumes_ProcessAutoWhispers),
+-- so it's driven off a fresh RaidConsumes_ScanRaid() against the fake
+-- roster: Waylock (the scanning player) and Aiden are Ready, Brine and
+-- Anahita are each missing something.
+RaidConsumes_ScanRaid()
+_G.__sentWhispers = {}
+RaidConsumes_LastWhisperTime = {}
+RaidConsumes_LastMissingSet = {}
+RaidConsumes_SendWhisperNow()
+
+local whisperedNames = {}
+for _, w in ipairs(_G.__sentWhispers) do whisperedNames[w.target] = true end
+check(whisperedNames["Brine"] == true, "Send Whisper Now whispers a raider missing something (Brine)")
+check(whisperedNames["Anahita"] == true, "Send Whisper Now whispers another raider missing something (Anahita)")
+check(whisperedNames["Waylock"] == nil, "Send Whisper Now never whispers the scanning player, even though the button is right there in their own window")
+check(whisperedNames["Aiden"] == nil, "Send Whisper Now doesn't whisper a Ready raider")
+
+check(RaidConsumes_LastWhisperTime["Brine"] ~= nil, "Send Whisper Now still records into the auto-whisper cooldown tracker")
+
+-- Bypasses the cooldown entirely -- calling it again immediately re-whispers
+-- the same still-missing raiders instead of silently doing nothing.
+_G.__sentWhispers = {}
+RaidConsumes_SendWhisperNow()
+local secondCallNames = {}
+for _, w in ipairs(_G.__sentWhispers) do secondCallNames[w.target] = true end
+check(secondCallNames["Brine"] == true, "Send Whisper Now bypasses the cooldown -- an immediate second click re-whispers the same raider")
+
+-- Reset shared trackers so nothing bleeds past this block.
+RaidConsumes_LastWhisperTime = {}
+RaidConsumes_LastMissingSet = {}
+_G.__sentWhispers = {}
 
 print("ALL CHECKS PASSED")
